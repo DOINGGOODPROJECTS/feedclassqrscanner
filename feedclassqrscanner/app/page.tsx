@@ -38,8 +38,6 @@ export default function Home() {
   const [status, setStatus] = useState("Idle");
   const [error, setError] = useState<string | null>(null);
   const [scanResult, setScanResult] = useState<ScanResponse | null>(null);
-  const [lastCode, setLastCode] = useState<string | null>(null);
-  const [manualCode, setManualCode] = useState("");
   const [scanningEnabled, setScanningEnabled] = useState(true);
   const [busy, setBusy] = useState(false);
 
@@ -155,7 +153,6 @@ export default function Home() {
     busyRef.current = true;
     lastCodeRef.current = code;
     setBusy(true);
-    setLastCode(code);
     setStatus("Checking badge");
     setError(null);
 
@@ -183,12 +180,6 @@ export default function Home() {
       busyRef.current = false;
       setBusy(false);
     }
-  }
-
-  async function handleManualSubmit(event: React.FormEvent) {
-    event.preventDefault();
-    if (!manualCode.trim()) return;
-    await handleScan(manualCode.trim());
   }
 
   return (
@@ -242,11 +233,31 @@ export default function Home() {
                   {detectorSupported ? "BarcodeDetector" : "ZXing (fallback)"}
                 </span>
               </div>
-              <div className="flex items-center justify-between rounded-2xl bg-black/5 px-4 py-3">
-                <span className="text-sm text-black/60">Last QR Code</span>
-                <span className="text-sm font-semibold text-black">
-                  {lastCode || "—"}
-                </span>
+            </div>
+
+            <div className="mt-6 rounded-[28px] border border-black/10 bg-[linear-gradient(135deg,rgba(255,255,255,0.94),rgba(0,0,0,0.02))] p-5">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-black/50">
+                How To Scan
+              </p>
+              <div className="mt-4 space-y-4">
+                <div className="rounded-2xl bg-black/5 px-4 py-3">
+                  <p className="text-sm font-semibold text-black">Hold badge inside the frame</p>
+                  <p className="mt-1 text-sm text-black/65">
+                    Keep the QR code centered and fully visible before moving closer.
+                  </p>
+                </div>
+                <div className="rounded-2xl bg-black/5 px-4 py-3">
+                  <p className="text-sm font-semibold text-black">Wait for automatic verification</p>
+                  <p className="mt-1 text-sm text-black/65">
+                    The scanner checks the code immediately and shows the result below.
+                  </p>
+                </div>
+                <div className="rounded-2xl bg-black/5 px-4 py-3">
+                  <p className="text-sm font-semibold text-black">If scanning fails</p>
+                  <p className="mt-1 text-sm text-black/65">
+                    Improve lighting, steady the camera, and fill more of the frame with the badge.
+                  </p>
+                </div>
               </div>
             </div>
 
@@ -255,29 +266,6 @@ export default function Home() {
                 {error}
               </div>
             )}
-
-            <form
-              onSubmit={handleManualSubmit}
-              className="mt-6 flex flex-col gap-3"
-            >
-              <label className="text-sm font-semibold text-black">
-                Manual entry
-              </label>
-              <div className="flex gap-3">
-                <input
-                  className="flex-1 rounded-2xl border border-black/10 px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
-                  placeholder="BADGE-ALPHA-001"
-                  value={manualCode}
-                  onChange={(event) => setManualCode(event.target.value)}
-                />
-                <button
-                  className="rounded-2xl bg-[var(--accent)] px-5 py-3 text-sm font-semibold text-white transition hover:brightness-95"
-                  type="submit"
-                >
-                  Check
-                </button>
-              </div>
-            </form>
           </div>
           </div>
 
@@ -374,11 +362,6 @@ export default function Home() {
                 </p>
               </div>
             </div>
-
-            <p className="mt-6 text-sm text-black/60">
-              Tip: Try dummy codes like <strong>BADGE-ALPHA-001</strong> or
-              <strong> BADGE-BETA-014</strong>.
-            </p>
           </div>
         </section>
       </main>
