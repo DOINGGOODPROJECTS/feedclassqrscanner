@@ -5,13 +5,33 @@ import { useEffect, useMemo, useRef, useState } from "react";
 type ScanResponse =
   | {
       found: true;
-      badge: {
-        id: number;
-        qrCode: string;
-        name: string;
-        status: string;
-        role: string;
+      child: {
+        id: string;
+        studentId: string;
+        fullName: string;
+        profileImageUrl: string | null;
+        school: { id: string; name: string; code: string } | null;
+        class: { id: string; name: string } | null;
+        subscription: {
+          status: string;
+          isSubscribed: boolean;
+          isGracePeriod: boolean;
+          gracePeriodEndsAt: string | null;
+          eligibleForMeal: boolean;
+          mealsRemaining?: number;
+          mealType?: string | null;
+          planName?: string | null;
+        };
       };
+      scan: {
+        id: string;
+        mealType: string;
+        servedAt: string;
+        outcome: "APPROVED" | "BLOCKED" | "DUPLICATE";
+        reason: string;
+      };
+      mealServeId: string | null;
+      verification?: MealVerificationResponse["verification"] | null;
       source: string;
       scannedAt: string;
     }
@@ -21,9 +41,30 @@ type ScanResponse =
       source: string;
     };
 
-const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") ||
-  "http://localhost:4000";
+const BACKEND_BASE =
+  process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, "") ||
+  "http://localhost:5000";
+const SCANNER_API_TOKEN =
+  process.env.NEXT_PUBLIC_SCANNER_API_TOKEN?.trim() || "";
+const SCANNER_EMAIL =
+  process.env.NEXT_PUBLIC_SCANNER_EMAIL || "admin@feedclass.test";
+const SCANNER_PASSWORD =
+  process.env.NEXT_PUBLIC_SCANNER_PASSWORD || "password123";
+
+type MealVerificationResponse = {
+  verification: {
+    mealServeId: string;
+    schoolId: string;
+    serveDate: string;
+    mealType: string;
+    leafHash: string;
+    merkleProof: Array<{ position: "left" | "right"; hash: string }>;
+    batchRoot: string | null;
+    txHash: string | null;
+    confirmationStatus: "UNANCHORED" | "PENDING" | "SUBMITTED" | "CONFIRMED" | "FAILED";
+    anchored: boolean;
+  };
+};
 
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -40,6 +81,22 @@ export default function Home() {
   const [scanResult, setScanResult] = useState<ScanResponse | null>(null);
   const [scanningEnabled, setScanningEnabled] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [verification, setVerification] = useState<MealVerificationResponse["verification"] | null>(null);
+  const [verificationError, setVerificationError] = useState<string | null>(null);
+  const [verifying, setVerifying] = useState(false);
+  const [lastScannedCode, setLastScannedCode] = useState<string | null>(null);
+  const accessTokenRef = useRef<string | null>(null);
+
+  const graceDaysRemaining =
+    scanResult && scanResult.found && scanResult.child.subscription.isGracePeriod
+      ? Math.max(
+          0,
+          Math.ceil(
+            (new Date(scanResult.child.subscription.gracePeriodEndsAt || "").getTime() - Date.now()) /
+              (1000 * 60 * 60 * 24)
+          )
+        )
+      : null;
 
   const detectorSupported = useMemo(() => {
     if (typeof window === "undefined") return false;
@@ -152,33 +209,141 @@ export default function Home() {
   async function handleScan(code: string) {
     busyRef.current = true;
     lastCodeRef.current = code;
+    setLastScannedCode(code);
     setBusy(true);
     setStatus("Checking badge");
     setError(null);
 
     try {
-      const response = await fetch(`${API_BASE}/api/scan`, {
+      const token = await getBackendAccessToken();
+      const response = await fetch(`${BACKEND_BASE}/scanner/meal-scans`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ qrCode: code }),
+        headers: {
+          "Content-Type": "application/json",
+          ...token,
+        },
+        body: JSON.stringify({ qrPayload: code, mealType: "LUNCH" }),
       });
 
-      const payload = (await response.json()) as ScanResponse;
+      const payload = await response.json();
       if (!response.ok) {
-        setScanResult(payload);
+        const failure: ScanResponse = {
+          found: false,
+          message:
+            payload && typeof payload.message === "string"
+              ? payload.message
+              : "Badge verification failed.",
+          source: "FeedClass backend",
+        };
+        setScanResult(failure);
+        setVerification(null);
         setStatus("Badge not found");
         return;
       }
 
-      setScanResult(payload);
+      const result: ScanResponse = {
+        found: true,
+        child: payload.child,
+        scan: payload.scan,
+        mealServeId: payload.mealServeId || null,
+        verification: payload.verification || null,
+        source: "FeedClass backend",
+        scannedAt: payload.scan?.servedAt || new Date().toISOString(),
+      };
+      setScanResult(result);
+      if (result.verification) {
+        setVerification(result.verification);
+        setVerificationError(null);
+      } else if (result.mealServeId) {
+        await handleVerifyMeal(result.mealServeId);
+      } else {
+        setVerification(null);
+        setVerificationError(null);
+      }
       setStatus("Badge verified");
     } catch (err) {
       console.error(err);
-      setError("Failed to reach the scanner API.");
+      setError("Failed to reach the FeedClass backend.");
       setStatus("Network error");
     } finally {
       busyRef.current = false;
       setBusy(false);
+    }
+  }
+
+  async function getBackendAccessToken(): Promise<Record<string, string>> {
+    if (SCANNER_API_TOKEN) {
+      return { "x-api-token": SCANNER_API_TOKEN };
+    }
+
+    if (accessTokenRef.current) {
+      return { Authorization: `Bearer ${accessTokenRef.current}` };
+    }
+
+    const response = await fetch(`${BACKEND_BASE}/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: SCANNER_EMAIL,
+        password: SCANNER_PASSWORD,
+      }),
+    });
+
+    const payload = await response.json();
+    if (!response.ok || !payload?.accessToken) {
+      throw new Error(payload?.message || "Scanner login failed.");
+    }
+
+    accessTokenRef.current = payload.accessToken;
+    return { Authorization: `Bearer ${payload.accessToken as string}` };
+  }
+
+  async function handleVerifyMeal(explicitMealId?: string) {
+    const targetMealId = explicitMealId || "";
+    if (!targetMealId) {
+      return;
+    }
+
+    setVerifying(true);
+    setVerificationError(null);
+
+    try {
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        const response = await fetch(
+          `${BACKEND_BASE}/blockchain/verify-meal/${encodeURIComponent(targetMealId)}`
+        );
+        const payload = (await response.json()) as MealVerificationResponse | { message?: string };
+
+        if (!response.ok || !("verification" in payload)) {
+          setVerification(null);
+          setVerificationError(
+            "message" in payload && typeof payload.message === "string"
+              ? payload.message
+              : "Failed to load blockchain proof."
+          );
+          return;
+        }
+
+        setVerification(payload.verification);
+        if (
+          payload.verification.batchRoot ||
+          payload.verification.txHash ||
+          payload.verification.merkleProof.length > 0 ||
+          payload.verification.confirmationStatus !== "UNANCHORED"
+        ) {
+          return;
+        }
+
+        if (attempt < 5) {
+          await new Promise((resolve) => setTimeout(resolve, 1200));
+        }
+      }
+    } catch (verifyError) {
+      console.error(verifyError);
+      setVerification(null);
+      setVerificationError("Failed to reach the FeedClass backend verification endpoint.");
+    } finally {
+      setVerifying(false);
     }
   }
 
@@ -266,6 +431,13 @@ export default function Home() {
                 {error}
               </div>
             )}
+
+            {lastScannedCode ? (
+              <div className="mt-4 rounded-2xl border border-black/10 bg-black/5 px-4 py-3">
+                <p className="text-xs uppercase tracking-[0.2em] text-black/50">Last scanned code</p>
+                <p className="mt-2 break-all text-sm font-medium text-black">{lastScannedCode}</p>
+              </div>
+            ) : null}
           </div>
           </div>
 
@@ -329,39 +501,152 @@ export default function Home() {
                 </p>
                 <p className="text-lg font-semibold text-black">
                   {scanResult && scanResult.found
-                    ? scanResult.badge.name
+                    ? scanResult.child.fullName
                     : "—"}
                 </p>
               </div>
               <div className="rounded-2xl bg-black/5 px-4 py-4">
                 <p className="text-xs uppercase tracking-[0.2em] text-black/50">
-                  Role
+                  Student ID
                 </p>
                 <p className="text-lg font-semibold text-black">
                   {scanResult && scanResult.found
-                    ? scanResult.badge.role
+                    ? scanResult.child.studentId
                     : "—"}
                 </p>
               </div>
               <div className="rounded-2xl bg-black/5 px-4 py-4">
                 <p className="text-xs uppercase tracking-[0.2em] text-black/50">
-                  Status
+                  School
                 </p>
                 <p className="text-lg font-semibold text-black">
                   {scanResult && scanResult.found
-                    ? scanResult.badge.status
+                    ? scanResult.child.school?.name || "—"
                     : "—"}
                 </p>
               </div>
               <div className="rounded-2xl bg-black/5 px-4 py-4">
                 <p className="text-xs uppercase tracking-[0.2em] text-black/50">
-                  Source
+                  Subscription
                 </p>
                 <p className="text-lg font-semibold text-black">
-                  {scanResult ? scanResult.source : "—"}
+                  {scanResult && scanResult.found
+                    ? scanResult.child.subscription.status.replaceAll("_", " ")
+                    : "—"}
                 </p>
               </div>
             </div>
+            {scanResult && scanResult.found ? (
+              <div className="mt-4 grid gap-4 lg:grid-cols-[220px_minmax(0,1fr)]">
+                <div className="rounded-3xl border border-black/10 bg-black/5 p-4">
+                  <div
+                    className="h-52 w-full rounded-2xl bg-white bg-cover bg-center"
+                    style={{
+                      backgroundImage: `url(${scanResult.child.profileImageUrl || "/qr-placeholder.svg"})`,
+                    }}
+                  />
+                </div>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="rounded-2xl bg-black/5 px-4 py-4">
+                    <p className="text-xs uppercase tracking-[0.2em] text-black/50">Class</p>
+                    <p className="text-lg font-semibold text-black">{scanResult.child.class?.name || "—"}</p>
+                  </div>
+                  <div className="rounded-2xl bg-black/5 px-4 py-4">
+                    <p className="text-xs uppercase tracking-[0.2em] text-black/50">Meal access</p>
+                    <p className="text-lg font-semibold text-black">
+                      {scanResult.child.subscription.eligibleForMeal ? "Eligible" : "Not eligible"}
+                    </p>
+                  </div>
+                  <div className="rounded-2xl bg-black/5 px-4 py-4">
+                    <p className="text-xs uppercase tracking-[0.2em] text-black/50">Meals remaining</p>
+                    <p className="text-lg font-semibold text-black">
+                      {scanResult.child.subscription.isGracePeriod
+                        ? `Grace meal · ${graceDaysRemaining ?? 0} day${graceDaysRemaining === 1 ? "" : "s"} left`
+                        : scanResult.child.subscription.mealsRemaining ?? "—"}
+                    </p>
+                  </div>
+                  <div className="rounded-2xl bg-black/5 px-4 py-4">
+                    <p className="text-xs uppercase tracking-[0.2em] text-black/50">Meal type</p>
+                    <p className="text-lg font-semibold text-black">
+                      {scanResult.child.subscription.mealType || scanResult.scan.mealType}
+                    </p>
+                  </div>
+                  <div className="rounded-2xl bg-black/5 px-4 py-4 sm:col-span-2">
+                    <p className="text-xs uppercase tracking-[0.2em] text-black/50">Scan result</p>
+                    <p className="mt-2 text-sm text-black/65">{scanResult.scan.reason}</p>
+                  </div>
+                </div>
+              </div>
+            ) : scanResult && !scanResult.found ? (
+              <div className="mt-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-4 text-sm text-red-700">
+                {scanResult.message}
+              </div>
+            ) : null}
+          </div>
+        </section>
+
+        <section className="w-full">
+          <div className="rounded-3xl border border-black/10 bg-[var(--surface)] p-6 shadow-[0_20px_60px_rgba(0,0,0,0.12)]">
+            <div>
+              <p className="text-sm uppercase tracking-[0.18em] text-black/50">
+                Blockchain Proof
+              </p>
+              <p className="text-2xl font-semibold text-black">
+                Proof is loaded automatically after a successful served-meal scan.
+              </p>
+            </div>
+
+            {verificationError ? (
+              <div className="mt-6 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                {verificationError}
+              </div>
+            ) : null}
+
+            {!verification && !verificationError ? (
+              <div className="mt-6 rounded-2xl border border-black/10 bg-black/5 px-4 py-4 text-sm text-black/65">
+                {scanResult && scanResult.found
+                  ? "Waiting for the backend proof record for this served meal."
+                  : "Scan a child QR badge first. When the backend records a served meal and returns a `mealServeId`, the CELO proof will appear here automatically."}
+              </div>
+            ) : null}
+
+            {verification ? (
+              <div className="mt-6 grid gap-4 lg:grid-cols-2">
+                <div className="rounded-2xl bg-black/5 px-4 py-4">
+                  <p className="text-xs uppercase tracking-[0.2em] text-black/50">Confirmation status</p>
+                  <p className="mt-2 text-lg font-semibold text-black">{verification.confirmationStatus}</p>
+                </div>
+                <div className="rounded-2xl bg-black/5 px-4 py-4">
+                  <p className="text-xs uppercase tracking-[0.2em] text-black/50">Batch root</p>
+                  <p className="mt-2 break-all text-sm font-semibold text-black">{verification.batchRoot || "—"}</p>
+                </div>
+                <div className="rounded-2xl bg-black/5 px-4 py-4 lg:col-span-2">
+                  <p className="text-xs uppercase tracking-[0.2em] text-black/50">Leaf hash</p>
+                  <p className="mt-2 break-all text-sm font-semibold text-black">{verification.leafHash}</p>
+                </div>
+                <div className="rounded-2xl bg-black/5 px-4 py-4 lg:col-span-2">
+                  <p className="text-xs uppercase tracking-[0.2em] text-black/50">Transaction hash</p>
+                  <p className="mt-2 break-all text-sm font-semibold text-black">{verification.txHash || "Not submitted yet"}</p>
+                </div>
+                <div className="rounded-2xl bg-black/5 px-4 py-4 lg:col-span-2">
+                  <p className="text-xs uppercase tracking-[0.2em] text-black/50">Merkle proof</p>
+                  <div className="mt-3 space-y-3">
+                    {verification.merkleProof.length > 0 ? (
+                      verification.merkleProof.map((entry, index) => (
+                        <div key={`${entry.hash}-${index}`} className="rounded-2xl bg-white px-4 py-3">
+                          <p className="text-xs uppercase tracking-[0.18em] text-black/45">
+                            Sibling {index + 1} · {entry.position}
+                          </p>
+                          <p className="mt-2 break-all text-sm font-semibold text-black">{entry.hash}</p>
+                        </div>
+                      ))
+                    ) : (
+                      <p className="text-sm text-black/60">No stored proof yet for this meal batch.</p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ) : null}
           </div>
         </section>
       </main>
